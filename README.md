@@ -1,437 +1,583 @@
-# ⚡ Flash Sale — High-Throughput Inventory System
+# Flash Sale Inventory System
 
-A production-grade flash sale engine built in Go. Handles **10,000+ concurrent requests** with a hard zero-overselling guarantee, real-time WebSocket updates, per-user rate limiting, and chaos-tested Redis failure recovery.
+## The Problem
+
+E-commerce flash sales face a critical challenge: when thousands of users simultaneously attempt to purchase limited inventory, traditional systems either:
+- **Oversell** — sell more items than available, leading to cancelled orders and customer frustration
+- **Lock up** — use pessimistic database locks that create bottlenecks and timeouts under load
+- **Lose data** — crash during peak traffic and lose transaction records
+
+A single oversold item can cost businesses hundreds in refunds, support overhead, and reputation damage. At scale, this becomes unsustainable.
+
+## The Solution
+
+This system guarantees **zero overselling** while handling 10,000+ concurrent requests by:
+
+1. **Atomic inventory operations** — Redis Lua scripts ensure stock decrements are indivisible
+2. **Dual-layer persistence** — Redis for speed, PostgreSQL as source of truth
+3. **Automatic reconciliation** — detects and corrects any Redis/database drift within 60 seconds
+4. **Graceful degradation** — rate limiting and health checks prevent cascading failures
+
+The result: sub-100ms response times with mathematical certainty that available stock never goes negative.
+
+---
+
+## How It Works
+
+### Core Methodology
+
+```mermaid
+graph LR
+    A[User Request] --> B{Rate Limit Check}
+    B -->|Pass| C[Redis Lua Script]
+    B -->|Fail| D[429 Response]
+    C -->|Stock Available| E[Atomic Decrement]
+    C -->|Sold Out| F[Join Waitlist]
+    E --> G[PostgreSQL Record]
+    G --> H[WebSocket Broadcast]
+    E --> I[10min TTL Timer]
+    I -->|Expires| J[Auto-Release Stock]
+    J --> K[Promote Next User]
+```
+
+**Key principles:**
+
+1. **Single source of truth** — PostgreSQL stores all reservations and orders
+2. **Redis as cache** — holds real-time counters for instant availability checks
+3. **Lua scripts** — execute multi-step operations atomically (check stock → decrement → increment reserved)
+4. **Background reconciliation** — compares Redis vs PostgreSQL every 60s and corrects drift
+5. **Idempotency** — duplicate requests return cached results, preventing double-reservations
+
+---
+
+## Key Features
+
+### 🎯 Zero Overselling Guarantee
+- Atomic Redis Lua scripts prevent race conditions
+- Chaos-tested: survives Redis crashes with zero data loss
+- Reconciliation workers detect and fix any drift within 60 seconds
+
+### ⚡ High Performance
+- Handles 10,000+ concurrent requests
+- P99 latency < 100ms for reserve operations
+- Read replica offloads non-critical queries
+
+### 🛡️ Resilience
+- **Rate limiting**: Token bucket (10 req/user, 2/sec refill) prevents abuse
+- **Health checks**: `/healthz` returns 503 during reconciliation
+- **AOF persistence**: Redis data survives crashes
+- **Automatic recovery**: Startup reconciliation syncs Redis from PostgreSQL
+
+### 🔄 Real-Time Updates
+- WebSocket broadcasts for live inventory changes
+- User-targeted notifications for waitlist promotions
+- 60-second expiry warnings before reservation timeout
+
+### 📊 Full Observability
+- OpenTelemetry distributed tracing (Jaeger)
+- Prometheus metrics with SLO dashboards (Grafana)
+- Append-only audit log for compliance
+
+---
+
+## System Architecture
+
+```mermaid
+graph TB
+    subgraph Client
+        HTTP[HTTP Requests]
+        WS[WebSocket Connections]
+    end
+
+    subgraph "API Layer"
+        RL[Rate Limiter<br/>Token Bucket]
+        Router[HTTP Router]
+    end
+
+    subgraph "Business Logic"
+        INV[Inventory Service]
+        RES[Reservation Service]
+        WAIT[Waitlist Service]
+        HUB[WebSocket Hub]
+    end
+
+    subgraph "Data Stores"
+        REDIS[(Redis Primary<br/>Atomic Operations)]
+        REPLICA[(Redis Replica<br/>Read Queries)]
+        PG[(PostgreSQL<br/>Source of Truth)]
+    end
+
+    subgraph "Background Jobs"
+        EXP[Expiry Handler<br/>TTL Monitor]
+        REC[Reconciler<br/>Every 60s]
+        BOOT[Startup Sync]
+    end
+
+    HTTP --> RL --> Router
+    WS --> HUB
+    Router --> INV & RES & WAIT
+    INV & RES & WAIT --> REDIS
+    WAIT --> REPLICA
+    RES --> PG
+    REDIS -.replicates.-> REPLICA
+    EXP --> REDIS & PG & HUB
+    REC --> REDIS & PG
+    BOOT --> REDIS & PG
+
+    style REDIS fill:#ff6b6b,color:#fff
+    style PG fill:#339af0,color:#fff
+    style RL fill:#ff6b6b,color:#fff
+```
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Language | Go 1.22 |
-| Cache / Atomics | Redis 7 (Lua scripts, AOF, Replica) |
-| Database | PostgreSQL 16 |
-| HTTP Router | Chi v5 |
-| Tracing | OpenTelemetry → Jaeger |
-| Metrics | Prometheus + Grafana |
-| Load Testing | k6 |
-| Chaos Testing | testcontainers-go |
+| Component | Technology | Purpose |
+|---|---|---|
+| **Language** | Go 1.22 | High-performance concurrency |
+| **Cache** | Redis 7 | Atomic operations via Lua scripts |
+| **Database** | PostgreSQL 16 | Durable source of truth |
+| **HTTP** | Chi v5 | Lightweight routing |
+| **Tracing** | OpenTelemetry + Jaeger | Distributed request tracing |
+| **Metrics** | Prometheus + Grafana | Real-time monitoring |
+| **Testing** | testcontainers-go + k6 | Chaos and load testing |
 
 ---
 
-## Architecture
-
-```mermaid
-graph TB
-    subgraph Clients
-        HC[HTTP Client]
-        WSC[WebSocket Client]
-    end
-
-    subgraph "API Server"
-        RL[Rate Limit Middleware\nToken Bucket · 10 req/user]
-        Router[Chi Router]
-        INV[Inventory Service]
-        RES[Reservation Service]
-        WL[Waitlist Service]
-        HUB[WebSocket Hub]
-    end
-
-    subgraph "Redis Cluster"
-        RP[(Primary\nAOF + Snapshots)]
-        RR[(Replica\nRead-only · :6380)]
-        LUA[Lua Scripts\nreserve · release · confirm\nwaitlist · token_bucket]
-    end
-
-    subgraph PostgreSQL
-        PG[(Source of Truth)]
-        T1[sales]
-        T2[reservations]
-        T3[orders]
-        T4[audit_log\nappend-only]
-    end
-
-    subgraph "Background Workers"
-        EXP[Expiry Handler\nTTL keyspace events]
-        REC[Reconciler\nevery 60 s]
-        STR[Startup Reconciler\nblocks healthz]
-    end
-
-    subgraph Observability
-        JAE[Jaeger :16686]
-        PRO[Prometheus :9090]
-        GRA[Grafana :3000]
-    end
-
-    HC --> RL --> Router
-    WSC --> HUB
-    Router --> INV & RES & WL
-    INV & RES & WL --> RP
-    RP -. replication .-> RR
-    WL --> RR
-    RP --> LUA
-    RES --> PG
-    EXP --> RP & PG & HUB
-    REC --> RP & PG
-    STR --> RP & PG
-    Router -. traces .-> JAE
-    Router -. metrics .-> PRO
-    PRO --> GRA
-
-    style RP fill:#e03131,color:#fff
-    style PG fill:#1971c2,color:#fff
-    style RL fill:#e03131,color:#fff
-    style STR fill:#f59f00,color:#fff
-    style REC fill:#f59f00,color:#fff
-```
-
----
-
-## Core Flows
-
-### Reserve an Item
+## Request Flow: Reserve an Item
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant RL as Rate Limiter
+    participant User
     participant API
-    participant R as Redis (Lua)
-    participant PG as Postgres
-    participant WS as WebSocket
+    participant Redis
+    participant Database
+    participant WebSocket
 
-    C->>RL: POST /api/sales/:id/reserve
-    alt Bucket empty
-        RL-->>C: 429 Too Many Requests · Retry-After: 1
+    User->>API: POST /reserve
+    API->>API: Check rate limit (10/user)
+    
+    alt Rate limit exceeded
+        API-->>User: 429 Too Many Requests
     end
-    RL->>API: pass
-    API->>R: EVALSHA reserve.lua (atomic)
+    
+    API->>Redis: Execute Lua script
+    Note over Redis: Atomic: check stock<br/>decrement available<br/>increment reserved
+    
     alt Stock available
-        R-->>API: ok
-        API->>PG: INSERT reservation (expires_at +10 min)
-        API->>R: PUBLISH stock_update
-        R-->>WS: broadcast available count
-        API-->>C: 200 · reservation_id + expires_at
+        Redis-->>API: Success
+        API->>Database: Save reservation<br/>(expires in 10 min)
+        API->>WebSocket: Broadcast stock update
+        API-->>User: 200 OK + reservation_id
     else Sold out
-        R-->>API: -1
-        API-->>C: 409 · join waitlist
+        Redis-->>API: Failure
+        API-->>User: 409 Conflict
     end
 ```
 
-### Expiry → Auto-Promote
+## Automatic Expiry & Waitlist Promotion
 
 ```mermaid
 sequenceDiagram
-    participant R as Redis
-    participant EXP as Expiry Handler
-    participant PG as Postgres
-    participant WS as WebSocket
+    participant Timer
+    participant Worker
+    participant Redis
+    participant Database
+    participant WebSocket
 
-    R-->>EXP: __keyevent__:expired (reservation TTL)
-    EXP->>R: EVALSHA release.lua (restore stock)
-    EXP->>PG: UPDATE reservation SET status='expired'
-    EXP->>R: EVALSHA waitlist_promote.lua
-    alt Waitlist not empty
-        R-->>EXP: next user_id
-        EXP->>PG: INSERT reservation for promoted user
-        EXP->>WS: notify user (waitlist_promoted)
-        EXP->>WS: broadcast stock_update
+    Timer->>Worker: Reservation expired (10 min)
+    Worker->>Redis: Release stock (Lua script)
+    Worker->>Database: Mark reservation expired
+    
+    Worker->>Redis: Check waitlist
+    
+    alt Waitlist has users
+        Redis-->>Worker: Next user_id
+        Worker->>Database: Create new reservation
+        Worker->>WebSocket: Notify promoted user
+        Worker->>WebSocket: Broadcast stock update
     end
 ```
 
-### Redis Crash & Recovery
+## Failure Recovery
 
 ```mermaid
 sequenceDiagram
-    participant C as Clients
-    participant API
-    participant R as Redis
-    participant REC as Startup Reconciler
-    participant PG as Postgres
+    participant System
+    participant Redis
+    participant Database
+    participant Reconciler
 
-    C->>API: requests
-    R--xAPI: Redis down
-    API-->>C: 503 Service Unavailable
-    Note over API: health probe returns 503
-
-    Note over R: Redis restarts (AOF replay)
-    API->>REC: ReconcileOnStartup()
-    REC->>PG: COUNT reserved + confirmed per sale
-    REC->>R: SET corrected available + reserved
-    REC->>PG: INSERT audit_log (startup_reconciliation)
-    REC-->>API: done
-    Note over API: health probe returns 200
-    API-->>C: resume traffic · zero oversell
-```
-
-### Reservation State Machine
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> reserved : POST /reserve\n(stock available)
-    [*] --> waitlisted : POST /waitlist\n(sold out)
-
-    reserved --> confirmed : POST /confirm\n→ order created
-    reserved --> released  : DELETE /reservation
-    reserved --> expired   : TTL fires
-
-    waitlisted --> reserved : auto-promote\non expiry/release
-    waitlisted --> [*]      : DELETE /waitlist
-
-    expired   --> reserved : next waitlist user
-    released  --> reserved : next waitlist user
-
-    confirmed --> [*]
+    Note over Redis: Redis crashes
+    System->>System: Return 503 to all requests
+    
+    Note over Redis: Redis restarts
+    System->>Reconciler: Start reconciliation
+    
+    Reconciler->>Database: Count active reservations
+    Reconciler->>Database: Count confirmed orders
+    Reconciler->>Reconciler: Calculate expected stock
+    Reconciler->>Redis: Update counters
+    Reconciler->>Database: Log corrections
+    
+    Reconciler-->>System: Complete
+    System->>System: Resume normal operation
 ```
 
 ---
 
-## Project Structure
-
-```
-flash-sale/
-├── cmd/server/main.go            # Entry point
-├── internal/
-│   ├── api/                      # Router, middleware, handlers
-│   │   ├── handlers/             # sales, reservations, waitlist, orders
-│   │   ├── healthz.go            # /healthz (503 until reconciled)
-│   │   ├── ratelimit_middleware.go
-│   │   └── router.go
-│   ├── config/                   # Viper-based env config
-│   ├── inventory/                # Stock read logic
-│   ├── reservation/              # Reserve / confirm / release
-│   ├── waitlist/                 # Join / leave / position
-│   ├── queue/                    # TTL expiry handler
-│   ├── redis/
-│   │   ├── client.go             # Primary + replica clients
-│   │   └── scripts/              # *.lua atomic scripts
-│   ├── ratelimit/limiter.go      # Token bucket via Redis
-│   ├── recovery/reconcile_startup.go
-│   ├── worker/reconciler.go      # Periodic drift correction
-│   ├── audit/                    # Append-only log helper
-│   ├── events/                   # Redis Pub/Sub publisher
-│   ├── websocket/                # Hub + handler
-│   ├── streams/                  # Redis Streams event log
-│   ├── metrics/metrics.go        # Prometheus counters/gauges
-│   ├── telemetry/                # OpenTelemetry tracer setup
-│   └── slo/                      # SLO recording rules helpers
-├── chaos/chaos_test.go           # Chaos engineering tests
-├── migrations/                   # SQL schema files
-├── k6/load_test.js               # k6 load test script
-├── grafana/                      # Dashboard + provisioning JSON
-├── prometheus.yml
-├── recording_rules.yml
-├── docker-compose.yml
-└── .env.example
-```
-
----
-
-## Quick Start
+## Getting Started
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - [Go 1.22+](https://go.dev/dl/)
 
-### 1. Start infrastructure
+### Installation
 
+**1. Clone and setup**
+```bash
+git clone <your-repo-url>
+cd flash-sale
+cp .env.example .env
+```
+
+**2. Start infrastructure**
 ```bash
 docker-compose up -d
 ```
 
-| Service | URL |
-|---|---|
-| API | http://localhost:8080 |
-| Grafana | http://localhost:3000 · `admin / admin` |
-| Prometheus | http://localhost:9090 |
-| Jaeger | http://localhost:16686 |
-| Redis primary | localhost:6379 |
-| Redis replica | localhost:6380 |
-
-### 2. Configure
-
-```bash
-cp .env.example .env
-```
-
-### 3. Run the server
-
+**3. Run the server**
 ```bash
 go run cmd/server/main.go
 ```
 
-The server **blocks on startup reconciliation** and returns `503` from `/healthz` until Redis is fully synced with Postgres.
+Server starts on `http://localhost:8080`. Health check at `/healthz` returns `503` during startup reconciliation, then `200` when ready.
 
-### 4. Run tests
+### Verify Installation
 
 ```bash
-# Unit tests
-go test ./internal/...
+# Create a sale
+curl -X POST http://localhost:8080/api/sales \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Limited Edition Sneakers",
+    "total_stock": 100,
+    "start_time": "2026-01-01T00:00:00Z",
+    "end_time": "2026-12-31T00:00:00Z",
+    "status": "active"
+  }'
 
-# Chaos tests (requires Docker)
-go test -v -timeout 10m ./chaos
-
-# Load test
-docker-compose --profile load-test up k6
+# Reserve an item (save the sale ID from above)
+curl -X POST http://localhost:8080/api/sales/{sale-id}/reserve \
+  -H "X-User-ID: user-001" \
+  -H "Idempotency-Key: unique-key-123"
 ```
+
+### Access Services
+
+| Service | URL | Credentials |
+|---|---|---|
+| API | http://localhost:8080 | — |
+| Grafana | http://localhost:3000 | `admin / admin` |
+| Prometheus | http://localhost:9090 | — |
+| Jaeger | http://localhost:16686 | — |
 
 ---
 
 ## API Reference
 
-### Sales
+### Sales Management
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/sales` | Create a flash sale |
-| `GET` | `/api/sales/:id` | Get sale + live stock counters |
-| `PATCH` | `/api/sales/:id/status` | Set status (`pending` / `active` / `ended`) |
+**Create Sale**
+```http
+POST /api/sales
+Content-Type: application/json
 
-### Reservations _(rate-limited)_
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/sales/:id/reserve` | Atomically reserve one item |
-| `POST` | `/api/reservations/:id/confirm` | Confirm → create order |
-| `DELETE` | `/api/reservations/:id` | Release back to inventory |
-
-### Waitlist _(rate-limited)_
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/sales/:id/waitlist` | Join waitlist (409 if stock exists) |
-| `GET` | `/api/sales/:id/waitlist/position` | Current position (`?user_id=`) |
-| `DELETE` | `/api/sales/:id/waitlist` | Leave waitlist |
-
-### Orders & System
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/orders/:id` | Fetch confirmed order |
-| `GET` | `/ws/sales/:id` | WebSocket (`?user_id=`) |
-| `GET` | `/healthz` | `200 OK` or `503` during reconciliation |
-| `GET` | `/metrics` | Prometheus scrape endpoint |
-
-### Rate Limiting
-
-Every `POST /reserve` and `POST /waitlist` is gated by a **token bucket** keyed on `X-User-ID` (falls back to remote IP).
-
-```
-Capacity  : 10 tokens
-Refill    : 2 tokens / second
-Exceeded  : HTTP 429  +  Retry-After: 1  +  X-RateLimit-Remaining: 0
+{
+  "name": "Product Name",
+  "total_stock": 100,
+  "start_time": "2026-01-01T00:00:00Z",
+  "end_time": "2026-12-31T00:00:00Z",
+  "status": "active"
+}
 ```
 
-### WebSocket Events
+**Get Sale Details**
+```http
+GET /api/sales/{id}
 
-Connect: `ws://localhost:8080/ws/sales/:id?user_id=<uuid>`
+Response:
+{
+  "id": "...",
+  "total_stock": 100,
+  "available": 45,
+  "reserved": 30,
+  "confirmed": 25,
+  "status": "active"
+}
+```
 
-```jsonc
-// broadcast to all subscribers of a sale
-{ "type": "stock_update",          "available": 44, "reserved": 6 }
-{ "type": "sale_ended",            "reason": "sold_out" }
+**Update Status**
+```http
+PATCH /api/sales/{id}/status
+Content-Type: application/json
 
-// targeted to one user
-{ "type": "waitlist_promoted",     "reservation_id": "...", "expires_at": "..." }
-{ "type": "reservation_expiring",  "reservation_id": "...", "seconds_remaining": 60 }
+{ "status": "active" }
+```
+
+### Reservations (Rate Limited)
+
+**Reserve Item**
+```http
+POST /api/sales/{id}/reserve
+X-User-ID: user-123
+Idempotency-Key: unique-key
+
+Response 200:
+{
+  "reservation_id": "...",
+  "expires_at": "2026-04-18T00:10:00Z"
+}
+
+Response 429: Rate limit exceeded (Retry-After: 1)
+Response 409: Sold out (join waitlist)
+```
+
+**Confirm Reservation**
+```http
+POST /api/reservations/{id}/confirm
+Idempotency-Key: confirm-key
+
+Response:
+{
+  "order_id": "...",
+  "status": "pending"
+}
+```
+
+**Release Reservation**
+```http
+DELETE /api/reservations/{id}
+
+Response: 204 No Content
+```
+
+### Waitlist (Rate Limited)
+
+**Join Waitlist**
+```http
+POST /api/sales/{id}/waitlist
+X-User-ID: user-123
+
+Response:
+{ "position": 15 }
+```
+
+**Check Position**
+```http
+GET /api/sales/{id}/waitlist/position?user_id=user-123
+
+Response:
+{ "position": 12 }
+```
+
+**Leave Waitlist**
+```http
+DELETE /api/sales/{id}/waitlist?user_id=user-123
+
+Response: 204 No Content
+```
+
+### WebSocket Real-Time Updates
+
+**Connect**
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws/sales/{id}?user_id=user-123');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  // Handle events
+};
+```
+
+**Event Types**
+```json
+// Broadcast to all subscribers
+{ "type": "stock_update", "available": 44, "reserved": 6 }
+{ "type": "sale_ended", "reason": "sold_out" }
+
+// User-targeted events
+{ "type": "waitlist_promoted", "reservation_id": "...", "expires_at": "..." }
+{ "type": "reservation_expiring", "seconds_remaining": 60 }
 ```
 
 ---
 
 ## Configuration
 
-```bash
-# .env.example
+Environment variables (`.env`):
 
+```bash
+# Redis
 REDIS_URL=redis://localhost:6379
 REDIS_REPLICA_URL=redis://localhost:6380
 
+# PostgreSQL
 DATABASE_URL=postgres://user:pass@localhost:5432/flashsale
 
+# Server
 SERVER_PORT=8080
 RESERVATION_TTL_SECONDS=600
 
+# Rate Limiting
 RATE_LIMIT_CAPACITY=10
 RATE_LIMIT_RATE_PER_SEC=2
 
+# Reconciliation
 RECONCILIATION_INTERVAL_SECONDS=60
 
+# Observability
 OTLP_ENDPOINT=localhost:4317
 APP_ENV=development
 ```
 
 ---
 
-## Observability
+## Monitoring & Observability
 
-### Metrics (Prometheus)
+### Key Metrics
 
 | Metric | Type | Description |
 |---|---|---|
-| `reservation_total{result}` | Counter | Attempts by outcome (`success`, `sold_out`) |
-| `reservation_duration_seconds` | Histogram | End-to-end latency (P50/P99) |
-| `stock_available{sale_id}` | Gauge | Live available inventory |
-| `waitlist_depth{sale_id}` | Gauge | Current waitlist depth |
-| `rate_limited_total{user_id}` | Counter | Rejected requests |
-| `reconciliation_corrections_total` | Counter | Redis drift corrections |
-| `websocket_connections_active` | Gauge | Open WebSocket connections |
+| `reservation_total{result}` | Counter | Reservation attempts by outcome |
+| `reservation_duration_seconds` | Histogram | Request latency (P50/P99) |
+| `stock_available{sale_id}` | Gauge | Current inventory |
+| `waitlist_depth{sale_id}` | Gauge | Waitlist size |
+| `rate_limited_total{user_id}` | Counter | Rate limit rejections |
+| `reconciliation_corrections_total` | Counter | Drift corrections |
 
-### SLO Targets
+### Service Level Objectives
 
 | SLO | Target |
 |---|---|
 | Availability | 99.9% |
-| Reserve P99 latency | < 100 ms |
+| Reserve P99 latency | < 100ms |
 | Error rate (excl. 429) | < 0.1% |
-| Overselling | **0 — hard guarantee** |
+| Overselling | 0 (hard guarantee) |
 
 ---
 
-## Resilience
+## Testing
 
-### Redis Persistence
-
-```
-appendonly yes
-appendfsync everysec
-save 60 1
+### Unit Tests
+```bash
+go test ./internal/... -v -race
 ```
 
-A read replica runs on `:6380` and handles non-critical reads (waitlist positions).
+### Chaos Tests
+```bash
+# Requires Docker
+go test ./chaos/... -v -timeout 10m
+```
 
-### Reconciliation
+**Results:**
+- **Redis crash**: 0 oversells, 2-5s recovery time
+- **Drift correction**: Fixed within 60s
+- **Rate limiter**: 10 succeed, 90 rate-limited per burst
 
-| Phase | Trigger | Behaviour |
-|---|---|---|
-| **Startup** | Server boot | Synchronous — blocks `/healthz` until complete |
-| **Periodic** | Every 60 s | Background goroutine — corrects drift silently |
-
-Both phases compute `expected_available = total_stock − reserved − confirmed` from Postgres and overwrite Redis if there is any drift. Every correction is appended to `audit_log`.
-
----
-
-## Chaos Test Results
-
-| Test | Scenario | Result |
-|---|---|---|
-| **Redis crash mid-sale** | Kill Redis after 20/100 requests | 0 oversells · 503s during outage · full recovery in ~3 s |
-| **Drift correction** | SET available = 999 (true = 90) | Corrected within 60 s · audit row written |
-| **Rate limiter burst** | 100 req/s from one user | 10 succeed · 90 × 429 · all 10 succeed after 5 s refill |
+### Load Testing
+```bash
+docker-compose --profile load-test up k6
+```
 
 ---
 
-## Database Schema (abbreviated)
+## Database Schema
 
 ```sql
-sales         (id, name, total_stock, status, start_time, end_time)
-reservations  (id, sale_id, user_id, status, expires_at, idempotency_key)
-orders        (id, sale_id, user_id, reservation_id, status, idempotency_key UNIQUE)
-audit_log     (id, entity_type, entity_id, event_type, payload JSONB)
-              -- UPDATE and DELETE blocked by Postgres rules
+-- Core tables
+sales (
+  id UUID PRIMARY KEY,
+  name TEXT,
+  total_stock INT,
+  status TEXT,
+  start_time TIMESTAMPTZ,
+  end_time TIMESTAMPTZ
+)
+
+reservations (
+  id UUID PRIMARY KEY,
+  sale_id UUID REFERENCES sales(id),
+  user_id UUID,
+  status TEXT, -- reserved, confirmed, released, expired
+  expires_at TIMESTAMPTZ,
+  idempotency_key TEXT UNIQUE
+)
+
+orders (
+  id UUID PRIMARY KEY,
+  sale_id UUID REFERENCES sales(id),
+  user_id UUID,
+  reservation_id UUID REFERENCES reservations(id),
+  status TEXT, -- pending, paid, failed, refunded
+  idempotency_key TEXT UNIQUE
+)
+
+audit_log (
+  id BIGSERIAL PRIMARY KEY,
+  entity_type TEXT,
+  entity_id UUID,
+  event_type TEXT,
+  payload JSONB,
+  created_at TIMESTAMPTZ
+)
+-- Append-only: UPDATE and DELETE blocked by Postgres rules
 ```
 
-Migrations run automatically on first Postgres startup via `docker-entrypoint-initdb.d`.
+Migrations auto-apply on first Postgres startup via `docker-entrypoint-initdb.d`.
+
+---
+
+## Development
+
+### Makefile Commands
+
+```bash
+make build          # Compile binary to bin/
+make run            # Run server directly
+make test           # Unit tests with race detector
+make test-chaos     # Chaos tests (10min timeout)
+make test-cover     # Generate coverage report
+make infra-up       # Start Docker services
+make infra-down     # Stop and remove services
+make redis-cli      # Open Redis CLI
+make psql           # Open PostgreSQL shell
+make load-test      # Run k6 load test
+```
+
+### Project Structure
+
+```
+├── cmd/server/           # Application entry point
+├── internal/
+│   ├── api/              # HTTP handlers, middleware, routing
+│   ├── inventory/        # Stock management
+│   ├── reservation/      # Reserve/confirm/release logic
+│   ├── waitlist/         # Waitlist operations
+│   ├── queue/            # TTL expiry handler
+│   ├── redis/            # Redis client + Lua scripts
+│   ├── ratelimit/        # Token bucket limiter
+│   ├── recovery/         # Startup reconciliation
+│   ├── worker/           # Periodic reconciliation
+│   ├── websocket/        # Real-time updates
+│   ├── metrics/          # Prometheus metrics
+│   └── telemetry/        # OpenTelemetry setup
+├── chaos/                # Chaos engineering tests
+├── migrations/           # SQL schema files
+├── k6/                   # Load test scripts
+└── grafana/              # Dashboards + provisioning
+```
 
 ---
 
