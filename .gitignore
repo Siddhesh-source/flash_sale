@@ -1,3 +1,6 @@
+# Stale subfolder (ignore if exists)
+flash-sale/
+
 # Binaries
 bin/
 dist/
