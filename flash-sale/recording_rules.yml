@@ -1,0 +1,110 @@
+groups:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SLO 1 — Availability: 99.9% of /reserve must not return 5xx
+  # Error budget: 0.1%
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: slo_availability
+    rules:
+      # 5-minute rolling success rate
+      - record: slo:reserve_success_rate:5m
+        expr: |
+          1 - (
+            rate(http_requests_total{route=~".*/reserve",status=~"5.."}[5m])
+            /
+            rate(http_requests_total{route=~".*/reserve"}[5m])
+          )
+
+      # Burn rate: how fast we're consuming the 0.1% error budget
+      # burn_rate = current_error_rate / allowed_error_rate(0.001)
+      - record: slo:reserve_error_budget_burn_rate:5m
+        expr: |
+          (
+            rate(http_requests_total{route=~".*/reserve",status=~"5.."}[5m])
+            /
+            rate(http_requests_total{route=~".*/reserve"}[5m])
+          ) / 0.001
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SLO 2 — Latency: p99 of /reserve < 100ms
+  # Error budget: 1%
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: slo_latency
+    rules:
+      - record: slo:reserve_p99_latency:5m
+        expr: |
+          histogram_quantile(0.99,
+            rate(reservation_duration_seconds_bucket[5m])
+          )
+
+      - record: slo:reserve_p50_latency:5m
+        expr: |
+          histogram_quantile(0.50,
+            rate(reservation_duration_seconds_bucket[5m])
+          )
+
+      - record: slo:reserve_p95_latency:5m
+        expr: |
+          histogram_quantile(0.95,
+            rate(reservation_duration_seconds_bucket[5m])
+          )
+
+      # Fraction of requests exceeding 100ms (error budget consumption)
+      - record: slo:reserve_latency_error_rate:5m
+        expr: |
+          1 - (
+            rate(reservation_duration_seconds_bucket{le="0.1"}[5m])
+            /
+            rate(reservation_duration_seconds_count[5m])
+          )
+
+      # Burn rate against 1% budget
+      - record: slo:reserve_latency_burn_rate:5m
+        expr: |
+          (
+            1 - (
+              rate(reservation_duration_seconds_bucket{le="0.1"}[5m])
+              /
+              rate(reservation_duration_seconds_count[5m])
+            )
+          ) / 0.01
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SLO 3 — Correctness: zero reconciliation corrections
+  # Any nonzero value is a correctness event (oversell or drift)
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: slo_correctness
+    rules:
+      - record: slo:reconciliation_correction_rate:5m
+        expr: rate(reconciliation_corrections_total[5m])
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Alerting rules
+  # ─────────────────────────────────────────────────────────────────────────────
+  - name: slo_alerts
+    rules:
+      - alert: ReserveAvailabilityBudgetBurningFast
+        expr: slo:reserve_error_budget_burn_rate:5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Reserve endpoint burning error budget >14.4x rate"
+          description: "SLO 1 (availability) burn rate is {{ $value | printf \"%.2f\" }}x over the last 5 minutes."
+
+      - alert: ReserveLatencyBudgetBurningFast
+        expr: slo:reserve_latency_burn_rate:5m > 14.4
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reserve p99 latency burning error budget >14.4x rate"
+          description: "SLO 2 (latency) burn rate is {{ $value | printf \"%.2f\" }}x."
+
+      - alert: CorrectnessViolation
+        expr: increase(reconciliation_corrections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stock reconciliation correction detected (potential oversell)"
+          description: "{{ $value }} correction(s) in the last 5 minutes."

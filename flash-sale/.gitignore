@@ -1,0 +1,56 @@
+# Binaries
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+flash-sale
+flash-sale-server
+
+# Go build cache
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Environment — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testcontainers / Docker artifacts
+/tmp/
+testcontainers.properties
+
+# Grafana provisioned state
+grafana/grafana.db
+grafana/*.db
+
+# Redis dump (if mounted locally)
+dump.rdb
+appendonly.aof
+
+# Profiling
+*.prof
+*.pprof
+
+# Air (live reload)
+.air.toml
+tmp/
